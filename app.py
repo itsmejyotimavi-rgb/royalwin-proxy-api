@@ -1,11 +1,20 @@
+import os
 import time
+import logging
 import threading
 import requests
 import re
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="RoyalWin High-Speed Live Draw API", version="1.0")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("royalwin-api")
+
+app = FastAPI(title="RoyalWin High-Speed Live Draw API", version="1.1")
 
 # Enable CORS so any web or desktop client can access it freely
 app.add_middleware(
@@ -16,7 +25,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DOMAINS = [
+# Custom domain override from environment variable if available
+CUSTOM_DOMAIN = os.getenv("ROYALWIN_DOMAIN", "").strip()
+
+DEFAULT_DOMAINS = [
+    "www.royal777.win",
+    "royal777.win",
+    "royalwin6.com",
+    "www.royalwin6.com",
     "www.royalwin1.com",
     "www.royalwin2.com",
     "www.royalwin3.com",
@@ -24,8 +40,10 @@ DOMAINS = [
     "www.royalwin5.com",
     "www.royalwin7.com",
     "www.royalwin8.com",
-    "www.royalwin9.com"
+    "www.royalwin9.com",
 ]
+
+DOMAINS = [CUSTOM_DOMAIN] + [d for d in DEFAULT_DOMAINS if d != CUSTOM_DOMAIN] if CUSTOM_DOMAIN else DEFAULT_DOMAINS
 
 GAME_MAP = {
     "15s": "SELF_MONEY_TREE_15S",
@@ -41,6 +59,12 @@ CACHE = {
     "SELF_MONEY_TREE_15S": None,
     "SELF_MONEY_TREE_30S": None,
     "SELF_MONEY_TREE": None,
+}
+
+LAST_ERROR = {
+    "domain": None,
+    "time": None,
+    "message": "Initializing..."
 }
 
 class FastFetcher:
@@ -73,6 +97,7 @@ class FastFetcher:
             })
 
     def _init_cookies(self, game_id="SELF_MONEY_TREE_30S"):
+        global LAST_ERROR
         with self.lock:
             start_idx = self.active_domain_idx
             num = len(DOMAINS)
@@ -86,7 +111,8 @@ class FastFetcher:
                     self.session.cookies.clear()
 
                     auth_url = f'https://{target}/security/auth?url=%2Flottery-bet%2F{game_id}'
-                    r = self.session.get(auth_url, timeout=3.5)
+                    logger.info(f"Attempting auth on {target}...")
+                    r = self.session.get(auth_url, timeout=4.0)
                     if r.status_code == 200:
                         cct_list = re.findall(r'cct[="]+([0-9a-f]{32})', r.text)
                         r_list = re.findall(r'r=(\d+)', r.text)
@@ -94,12 +120,22 @@ class FastFetcher:
                             self.session.cookies.set('cct', cct_list[-1], domain=target, path='/')
                             self.session.cookies.set('r', r_list[-1], domain=target, path='/')
                             self.last_auth_time = time.time()
+                            logger.info(f"[SUCCESS] Authenticated on {target}")
+                            LAST_ERROR = {"domain": target, "time": time.ctime(), "message": "Authenticated successfully"}
                             return True
-                except Exception:
+                        else:
+                            LAST_ERROR = {"domain": target, "time": time.ctime(), "message": "Auth cookies not found in page response"}
+                    else:
+                        LAST_ERROR = {"domain": target, "time": time.ctime(), "message": f"Auth returned HTTP {r.status_code}"}
+                except Exception as ex:
+                    LAST_ERROR = {"domain": target, "time": time.ctime(), "message": str(ex)}
+                    logger.warning(f"Domain {target} failed: {ex}")
                     continue
+            logger.error("All mirror domains failed authentication. Check active domains or network/VPN.")
             return False
 
     def fetch(self, game_id):
+        global LAST_ERROR
         with self.lock:
             now = time.time()
             if (now - self.last_auth_time) > 480:
@@ -110,7 +146,7 @@ class FastFetcher:
             for _ in range(2):
                 url = f'https://{self.domain}/fg/api/v0/real_time_lottery.do'
                 try:
-                    res = self.session.post(url, json=payload, timeout=3.5)
+                    res = self.session.post(url, json=payload, timeout=4.0)
                     if res.status_code == 200:
                         data = res.json()
                         cur_list = data.get('currentLotteries', [])
@@ -141,10 +177,12 @@ class FastFetcher:
                                         "updated_at": round(time.time(), 3)
                                     }
                     elif res.status_code in (401, 403, 302, 404, 502, 503):
+                        LAST_ERROR = {"domain": self.domain, "time": time.ctime(), "message": f"API returned HTTP {res.status_code}"}
                         self.active_domain_idx = (self.active_domain_idx + 1) % len(DOMAINS)
                         self._reset_session()
                         self._init_cookies(game_id)
-                except Exception:
+                except Exception as ex:
+                    LAST_ERROR = {"domain": self.domain, "time": time.ctime(), "message": str(ex)}
                     self.active_domain_idx = (self.active_domain_idx + 1) % len(DOMAINS)
                     self._reset_session()
                     self._init_cookies(game_id)
@@ -160,8 +198,8 @@ def background_sync_worker():
                 res = fetcher.fetch(gid)
                 if res:
                     CACHE[gid] = res
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Background fetch error: {e}")
             time.sleep(0.5)
         time.sleep(1.0)
 
@@ -202,3 +240,21 @@ def get_all():
         "1m": CACHE.get("SELF_MONEY_TREE")
     }
 
+@app.get("/api/status")
+def get_status():
+    return {
+        "active_domain": fetcher.domain,
+        "configured_domains": DOMAINS,
+        "last_auth_time": fetcher.last_auth_time,
+        "last_diagnostic": LAST_ERROR,
+        "cached_data": {
+            k: ("Available" if v else "Empty") for k, v in CACHE.items()
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n" + "="*50)
+    print("Starting RoyalWin API Server on http://127.0.0.1:8000")
+    print("="*50 + "\n")
+    uvicorn.run("APP:app", host="0.0.0.0", port=8000, reload=True)
