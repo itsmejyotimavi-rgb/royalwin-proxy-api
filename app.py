@@ -33,17 +33,11 @@ DEFAULT_DOMAINS = [
     "royal777.win",
     "royalwin6.com",
     "www.royalwin6.com",
-    "www.royalwin1.com",
-    "www.royalwin2.com",
-    "www.royalwin3.com",
-    "www.royalwin4.com",
-    "www.royalwin5.com",
-    "www.royalwin7.com",
-    "www.royalwin8.com",
-    "www.royalwin9.com",
 ]
 
 DOMAINS = [CUSTOM_DOMAIN] + [d for d in DEFAULT_DOMAINS if d != CUSTOM_DOMAIN] if CUSTOM_DOMAIN else DEFAULT_DOMAINS
+
+AUTH_MAX_AGE = 120  # Re-authenticate every 2 minutes to prevent cookie expiration
 
 GAME_MAP = {
     "15s": "SELF_MONEY_TREE_15S",
@@ -89,21 +83,25 @@ class FastFetcher:
                     pass
             self.session = requests.Session()
             self.session.headers.update({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
                 'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
                 'Content-Type': 'application/json',
                 'Origin': f'https://{self.domain}',
-                'Referer': f'https://{self.domain}/lottery-bet/SELF_MONEY_TREE_30S'
+                'Referer': f'https://{self.domain}/lottery-bet/SELF_MONEY_TREE_30S',
+                'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                'Sec-Ch-Ua-Mobile': '?0',
+                'Sec-Ch-Ua-Platform': '"Windows"',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin',
             })
 
     def _init_cookies(self, game_id="SELF_MONEY_TREE_30S"):
         global LAST_ERROR
         with self.lock:
-            start_idx = self.active_domain_idx
-            num = len(DOMAINS)
-            for offset in range(num):
-                idx = (start_idx + offset) % num
-                target = DOMAINS[idx]
+            # Always attempt primary working domains first
+            for idx, target in enumerate(DOMAINS):
                 try:
                     self.active_domain_idx = idx
                     self.session.headers['Origin'] = f'https://{target}'
@@ -111,16 +109,25 @@ class FastFetcher:
                     self.session.cookies.clear()
 
                     auth_url = f'https://{target}/security/auth?url=%2Flottery-bet%2F{game_id}'
-                    logger.info(f"Attempting auth on {target}...")
-                    r = self.session.get(auth_url, timeout=4.0)
+                    logger.info(f"Authenticating on {target}...")
+                    r = self.session.get(auth_url, timeout=5.0)
                     if r.status_code == 200:
                         cct_list = re.findall(r'cct[="]+([0-9a-f]{32})', r.text)
                         r_list = re.findall(r'r=(\d+)', r.text)
                         if cct_list and r_list:
-                            self.session.cookies.set('cct', cct_list[-1], domain=target, path='/')
-                            self.session.cookies.set('r', r_list[-1], domain=target, path='/')
+                            cct_val = cct_list[-1]
+                            r_val = r_list[-1]
+                            base_domain = target.replace("www.", "")
+                            # Set cookie for both full domain and base domain
+                            for d in [target, base_domain, f".{base_domain}"]:
+                                try:
+                                    self.session.cookies.set('cct', cct_val, domain=d, path='/')
+                                    self.session.cookies.set('r', r_val, domain=d, path='/')
+                                except Exception:
+                                    pass
+
                             self.last_auth_time = time.time()
-                            logger.info(f"[SUCCESS] Authenticated on {target}")
+                            logger.info(f"[SUCCESS] Authenticated on {target} (cct={cct_val[:6]}..., r={r_val})")
                             LAST_ERROR = {"domain": target, "time": time.ctime(), "message": "Authenticated successfully"}
                             return True
                         else:
@@ -131,6 +138,9 @@ class FastFetcher:
                     LAST_ERROR = {"domain": target, "time": time.ctime(), "message": str(ex)}
                     logger.warning(f"Domain {target} failed: {ex}")
                     continue
+
+            # If all failed, reset back to domain 0 for the next attempt
+            self.active_domain_idx = 0
             logger.error("All mirror domains failed authentication. Check active domains or network/VPN.")
             return False
 
@@ -138,15 +148,16 @@ class FastFetcher:
         global LAST_ERROR
         with self.lock:
             now = time.time()
-            if (now - self.last_auth_time) > 480:
+            # Proactively re-authenticate if token is older than AUTH_MAX_AGE (120s)
+            if (now - self.last_auth_time) > AUTH_MAX_AGE:
                 self._reset_session()
                 self._init_cookies(game_id)
 
             payload = {'gameId': game_id, 'platform': 'PC', 'siteId': 'sun'}
-            for _ in range(2):
+            for attempt in range(2):
                 url = f'https://{self.domain}/fg/api/v0/real_time_lottery.do'
                 try:
-                    res = self.session.post(url, json=payload, timeout=4.0)
+                    res = self.session.post(url, json=payload, timeout=5.0)
                     if res.status_code == 200:
                         data = res.json()
                         cur_list = data.get('currentLotteries', [])
@@ -176,13 +187,22 @@ class FastFetcher:
                                         "oe": oe,
                                         "updated_at": round(time.time(), 3)
                                     }
+
+                        # If status is 200 but latestDraws is empty, the session has expired!
+                        logger.warning(f"Empty draw data received on {self.domain} (Session likely expired). Re-authenticating...")
+                        self.last_auth_time = 0
+                        self._reset_session()
+                        self._init_cookies(game_id)
+
                     elif res.status_code in (401, 403, 302, 404, 502, 503):
                         LAST_ERROR = {"domain": self.domain, "time": time.ctime(), "message": f"API returned HTTP {res.status_code}"}
+                        self.last_auth_time = 0
                         self.active_domain_idx = (self.active_domain_idx + 1) % len(DOMAINS)
                         self._reset_session()
                         self._init_cookies(game_id)
                 except Exception as ex:
                     LAST_ERROR = {"domain": self.domain, "time": time.ctime(), "message": str(ex)}
+                    self.last_auth_time = 0
                     self.active_domain_idx = (self.active_domain_idx + 1) % len(DOMAINS)
                     self._reset_session()
                     self._init_cookies(game_id)
